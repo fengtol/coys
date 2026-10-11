@@ -1,0 +1,7 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "go": true,
+        "Get-Command": true,
+        "gradle -p android": true
+    }
+}
