@@ -10,7 +10,6 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -18,26 +17,24 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import org.json.JSONObject
-import java.net.DatagramPacket
-import java.net.DatagramSocket
-import java.net.InetAddress
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.net.InetSocketAddress
+import java.net.Socket
 import java.net.SocketException
-import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 
 class ClipboardSyncService : Service() {
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val outputLock = Any()
     private lateinit var clipboard: ClipboardManager
-    private var socket: DatagramSocket? = null
-    private var remoteAddress: InetAddress? = null
+    @Volatile private var socket: Socket? = null
     private var origin = ""
     private var lastText: String? = null
     private var pendingRemoteText: String? = null
     private var nextWriteAttemptAt = 0L
     private var isWritingRemote = false
-    private var multicastLock: WifiManager.MulticastLock? = null
     @Volatile private var active = false
 
     private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
@@ -72,46 +69,97 @@ class ClipboardSyncService : Service() {
 
     private fun startSync(server: String) {
         stopSync()
-        try {
-            remoteAddress = InetAddress.getByName(server)
-            origin = UUID.randomUUID().toString()
-            val wifi = getSystemService(Context.WIFI_SERVICE) as WifiManager
-            multicastLock = wifi.createMulticastLock("clipboard-sync").apply {
-                setReferenceCounted(false)
-                acquire()
-            }
-            socket = DatagramSocket(null).apply {
-                reuseAddress = true
-                broadcast = true
-                bind(InetSocketAddress(UDP_PORT))
-                soTimeout = RECEIVE_TIMEOUT_MS
-            }
-            lastText = readClipboardText()
-            pendingRemoteText = null
-            nextWriteAttemptAt = 0L
-            active = true
-            clipboard.addPrimaryClipChangedListener(clipboardListener)
-            mainHandler.post(pollRunnable)
-            updateNotification("已连接 $server:$UDP_PORT")
-            Thread({ receiveLoop() }, "clipboard-udp-receiver").start()
-        } catch (error: Exception) {
-            Log.e(TAG, "Unable to start clipboard sync", error)
-            updateNotification("启动失败：${error.message ?: error.javaClass.simpleName}")
-            stopSync()
+        origin = UUID.randomUUID().toString()
+        lastText = try {
+            readClipboardText()
+        } catch (error: SecurityException) {
+            Log.w(TAG, "Android denied access to the initial clipboard", error)
+            null
         }
+        pendingRemoteText = null
+        nextWriteAttemptAt = 0L
+        active = true
+        clipboard.addPrimaryClipChangedListener(clipboardListener)
+        mainHandler.post(pollRunnable)
+        updateNotification("正在连接 $server:$TCP_PORT")
+        Thread({ connectionLoop(server) }, "clipboard-tcp-client").start()
+    }
+
+    private fun connectionLoop(server: String) {
+        while (active) {
+            var connection: Socket? = null
+            try {
+                connection = Socket()
+                connection.connect(InetSocketAddress(server, TCP_PORT), CONNECT_TIMEOUT_MS)
+                connection.tcpNoDelay = true
+                socket = connection
+                postNotification("已连接 $server:$TCP_PORT")
+                Log.i(TAG, "Connected to relay $server:$TCP_PORT")
+                readMessages(connection)
+            } catch (error: Exception) {
+                if (active) {
+                    Log.w(TAG, "TCP relay connection lost; reconnecting", error)
+                    postNotification("连接中断，正在重连")
+                }
+            } finally {
+                if (socket === connection) socket = null
+                try {
+                    connection?.close()
+                } catch (error: Exception) {
+                    Log.w(TAG, "Error closing relay socket", error)
+                }
+            }
+            if (active) {
+                try {
+                    Thread.sleep(RECONNECT_INTERVAL_MS)
+                } catch (_: InterruptedException) {
+                    if (!active) return
+                }
+            }
+        }
+    }
+
+    private fun readMessages(connection: Socket) {
+        val input = connection.getInputStream()
+        while (active && !connection.isClosed) {
+            val line = readLine(input) ?: throw SocketException("relay closed the connection")
+            val message = parseMessage(line) ?: continue
+            if (message.first == origin) continue
+            mainHandler.post {
+                if (!active) return@post
+                if (message.second == lastText && pendingRemoteText == null) {
+                    updateNotification("收到更新，内容与本机相同")
+                    return@post
+                }
+                pendingRemoteText = message.second
+                writeRemoteClipboard(message.second)
+            }
+        }
+    }
+
+    private fun readLine(input: InputStream): ByteArray? {
+        val output = ByteArrayOutputStream()
+        while (output.size() <= MAX_PACKET_SIZE) {
+            val value = input.read()
+            if (value < 0) {
+                return if (output.size() == 0) null else output.toByteArray()
+            }
+            if (value == '\n'.code) return output.toByteArray()
+            if (value != '\r'.code) output.write(value)
+        }
+        throw IllegalArgumentException("TCP message exceeds $MAX_PACKET_SIZE bytes")
     }
 
     private fun stopSync() {
         active = false
         mainHandler.removeCallbacks(pollRunnable)
         clipboard.removePrimaryClipChangedListener(clipboardListener)
-        socket?.close()
-        socket = null
-        remoteAddress = null
-        multicastLock?.let {
-            if (it.isHeld) it.release()
+        try {
+            socket?.close()
+        } catch (error: Exception) {
+            Log.w(TAG, "Error closing relay socket", error)
         }
-        multicastLock = null
+        socket = null
     }
 
     private fun pollClipboard() {
@@ -154,38 +202,20 @@ class ClipboardSyncService : Service() {
             Log.w(TAG, "Encoded clipboard update exceeds $MAX_PACKET_SIZE bytes")
             return
         }
-        val target = remoteAddress ?: return
-        val activeSocket = socket ?: return
-        activeSocket.send(DatagramPacket(data, data.size, target, UDP_PORT))
-        lastText = text
-    }
 
-    private fun receiveLoop() {
-        val buffer = ByteArray(MAX_PACKET_SIZE + 1)
-        while (active) {
-            val packet = DatagramPacket(buffer, buffer.size)
-            try {
-                val activeSocket = socket ?: return
-                activeSocket.receive(packet)
-                val message = parseMessage(packet.data, packet.length) ?: continue
-                if (message.first == origin) continue
-                mainHandler.post {
-                    if (!active) return@post
-                    if (message.second == lastText && pendingRemoteText == null) {
-                        updateNotification("收到广播，剪贴板内容相同")
-                        return@post
-                    }
-                    pendingRemoteText = message.second
-                    writeRemoteClipboard(message.second)
-                }
-            } catch (_: SocketTimeoutException) {
-                continue
-            } catch (error: SocketException) {
-                if (active) Log.e(TAG, "UDP socket failed", error)
-                return
-            } catch (error: Exception) {
-                if (active) Log.e(TAG, "Unable to receive clipboard packet", error)
+        try {
+            synchronized(outputLock) {
+                val connection = socket ?: return
+                val output = connection.getOutputStream()
+                output.write(data)
+                output.write('\n'.code)
+                output.flush()
             }
+            lastText = text
+            Log.i(TAG, "Clipboard update sent to relay")
+        } catch (error: Exception) {
+            Log.e(TAG, "Unable to send clipboard update", error)
+            updateNotification("发送失败，正在重连")
         }
     }
 
@@ -208,10 +238,10 @@ class ClipboardSyncService : Service() {
         }
     }
 
-    private fun parseMessage(data: ByteArray, length: Int): Pair<String, String>? {
-        if (length <= 0 || length > MAX_PACKET_SIZE) return null
+    private fun parseMessage(data: ByteArray): Pair<String, String>? {
+        if (data.isEmpty() || data.size > MAX_PACKET_SIZE) return null
         return try {
-            val json = JSONObject(String(data, 0, length, StandardCharsets.UTF_8))
+            val json = JSONObject(String(data, StandardCharsets.UTF_8))
             val version = json.optInt("version", -1)
             val type = json.optString("type")
             val messageOrigin = json.optString("origin")
@@ -221,15 +251,19 @@ class ClipboardSyncService : Service() {
                 text.contains('\u0000') ||
                 text.toByteArray(StandardCharsets.UTF_8).size > MAX_TEXT_BYTES
             ) {
-                Log.w(TAG, "Discarded invalid clipboard packet")
+                Log.w(TAG, "Discarded invalid clipboard message")
                 null
             } else {
                 messageOrigin to text
             }
         } catch (error: Exception) {
-            Log.w(TAG, "Discarded malformed clipboard packet", error)
+            Log.w(TAG, "Discarded malformed clipboard message", error)
             null
         }
+    }
+
+    private fun postNotification(status: String) {
+        mainHandler.post { updateNotification(status) }
     }
 
     private fun startForegroundCompat(notification: Notification) {
@@ -297,9 +331,10 @@ class ClipboardSyncService : Service() {
         private const val TAG = "ClipboardSync"
         private const val CHANNEL_ID = "clipboard-sync"
         private const val NOTIFICATION_ID = 65432
-        private const val UDP_PORT = 65432
-        private const val RECEIVE_TIMEOUT_MS = 1000
+        private const val TCP_PORT = 65432
+        private const val CONNECT_TIMEOUT_MS = 5000
         private const val POLL_INTERVAL_MS = 500L
+        private const val RECONNECT_INTERVAL_MS = 3000L
         private const val WRITE_RETRY_INTERVAL_MS = 2000L
         private const val PROTOCOL_VERSION = 1
         private const val MESSAGE_TYPE = "clipboard"

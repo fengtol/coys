@@ -3,45 +3,49 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/example/clipboard-sync/internal/protocol"
 )
 
+type readResult struct {
+	message protocol.Message
+	err     error
+}
+
 type clipboardState struct {
-	mu   sync.Mutex
 	text string
 }
 
-func (state *clipboardState) syncLocal(
-	connection *net.UDPConn,
-	remote *net.UDPAddr,
-	origin string,
-) error {
-	state.mu.Lock()
-	defer state.mu.Unlock()
+func (state *clipboardState) syncLocal(connection net.Conn, origin string) error {
 	text, hasText, err := readClipboard()
 	if err != nil {
 		return err
 	}
-	if !hasText {
-		return nil
-	}
-	if text == state.text {
+	if !hasText || text == state.text {
 		return nil
 	}
 	message, err := protocol.Marshal(protocol.New(origin, text))
 	if err != nil {
 		return err
 	}
-	if _, err := connection.WriteToUDP(message, remote); err != nil {
+	message = append(message, '\n')
+	if err := connection.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return err
+	}
+	if err := writeAll(connection, message); err != nil {
+		return err
+	}
+	if err := connection.SetWriteDeadline(time.Time{}); err != nil {
 		return err
 	}
 	state.text = text
@@ -49,8 +53,6 @@ func (state *clipboardState) syncLocal(
 }
 
 func (state *clipboardState) applyRemote(text string) error {
-	state.mu.Lock()
-	defer state.mu.Unlock()
 	if text == state.text {
 		return nil
 	}
@@ -63,7 +65,7 @@ func (state *clipboardState) applyRemote(text string) error {
 
 func main() {
 	serverAddress := flag.String("server", "", "Debian relay IP address or hostname")
-	serverPort := flag.Int("port", 65432, "relay UDP port")
+	serverPort := flag.Int("port", 65432, "relay TCP port")
 	pollInterval := flag.Duration("poll", 500*time.Millisecond, "clipboard polling interval")
 	flag.Parse()
 	if *serverAddress == "" {
@@ -76,23 +78,6 @@ func main() {
 		log.Fatal("poll interval must be positive")
 	}
 
-	remote, err := net.ResolveUDPAddr("udp", net.JoinHostPort(*serverAddress, fmt.Sprint(*serverPort)))
-	if err != nil {
-		log.Fatalf("resolve relay address: %v", err)
-	}
-	local, err := net.ResolveUDPAddr("udp", ":65432")
-	if err != nil {
-		log.Fatalf("resolve local address: %v", err)
-	}
-	connection, err := net.ListenUDP("udp", local)
-	if err != nil {
-		log.Fatalf("bind UDP port 65432: %v", err)
-	}
-	defer connection.Close()
-	if err := enableBroadcast(connection); err != nil {
-		log.Fatalf("enable UDP broadcast: %v", err)
-	}
-
 	origin, err := newOrigin()
 	if err != nil {
 		log.Fatalf("create client ID: %v", err)
@@ -102,42 +87,78 @@ func main() {
 		log.Fatalf("read initial clipboard: %v", err)
 	} else if hasText {
 		state.text = initialText
-	} else {
-		state.text = ""
 	}
 
-	log.Printf("clipboard client started; relay=%s; local UDP port=65432", remote)
-	go receive(connection, origin, state)
-
+	address := net.JoinHostPort(*serverAddress, fmt.Sprint(*serverPort))
 	ticker := time.NewTicker(*pollInterval)
 	defer ticker.Stop()
-	for range ticker.C {
-		if err := state.syncLocal(connection, remote, origin); err != nil {
-			log.Printf("send clipboard update: %v", err)
+	for {
+		connection, err := net.DialTimeout("tcp", address, 5*time.Second)
+		if err != nil {
+			log.Printf("connect to relay %s: %v; retrying in 3 seconds", address, err)
+			time.Sleep(3 * time.Second)
+			continue
 		}
+		log.Printf("connected to TCP relay %s", address)
+		incoming := make(chan readResult, 1)
+		go receive(connection, incoming)
+		connected := true
+		for connected {
+			select {
+			case <-ticker.C:
+				if err := state.syncLocal(connection, origin); err != nil {
+					log.Printf("send clipboard update: %v", err)
+					connected = false
+				}
+			case result := <-incoming:
+				if result.err != nil {
+					log.Printf("relay connection closed: %v", result.err)
+					connected = false
+					continue
+				}
+				if result.message.Origin == origin {
+					continue
+				}
+				if err := state.applyRemote(result.message.Text); err != nil {
+					log.Printf("write clipboard: %v", err)
+				}
+			}
+		}
+		connection.Close()
+		time.Sleep(3 * time.Second)
 	}
 }
 
-func receive(connection *net.UDPConn, origin string, state *clipboardState) {
-	buffer := make([]byte, protocol.MaxPacketSize+1)
-	for {
-		n, _, err := connection.ReadFromUDP(buffer)
+func receive(connection net.Conn, results chan<- readResult) {
+	scanner := bufio.NewScanner(connection)
+	scanner.Buffer(make([]byte, 4096), protocol.MaxPacketSize)
+	for scanner.Scan() {
+		message, err := protocol.Parse(scanner.Bytes())
 		if err != nil {
-			log.Printf("receive UDP packet: %v", err)
-			return
-		}
-		message, err := protocol.Parse(buffer[:n])
-		if err != nil {
-			log.Printf("discard invalid clipboard packet: %v", err)
+			log.Printf("discard invalid relay message: %v", err)
 			continue
 		}
-		if message.Origin == origin {
-			continue
-		}
-		if err := state.applyRemote(message.Text); err != nil {
-			log.Printf("write clipboard: %v", err)
-		}
+		results <- readResult{message: message}
 	}
+	err := scanner.Err()
+	if err == nil {
+		err = errors.New("connection reached EOF")
+	}
+	results <- readResult{err: err}
+}
+
+func writeAll(writer io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := writer.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
 }
 
 func newOrigin() (string, error) {
@@ -146,18 +167,4 @@ func newOrigin() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(id[:]), nil
-}
-
-func enableBroadcast(connection *net.UDPConn) error {
-	raw, err := connection.SyscallConn()
-	if err != nil {
-		return err
-	}
-	var socketErr error
-	if err := raw.Control(func(fd uintptr) {
-		socketErr = syscallSetsockoptBroadcast(fd)
-	}); err != nil {
-		return err
-	}
-	return socketErr
 }

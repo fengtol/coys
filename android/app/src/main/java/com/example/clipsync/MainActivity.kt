@@ -35,7 +35,7 @@ class MainActivity : Activity() {
         }
         layout.addView(addressInput, matchWidth())
         layout.addView(TextView(this).apply {
-            text = "UDP 端口固定为 65432。仅在可信任的同一局域网使用；广播内容没有加密或认证。Android 10 及以上可能限制后台读取剪贴板。"
+            text = "TCP 端口固定为 65432。所有客户端通过服务器互相转发文本。仅在可信任的网络使用；通信没有加密或认证。Android 10 及以上只允许前台应用或默认输入法读取剪贴板；前台服务不能绕过此系统限制。"
             textSize = 14f
             setPadding(0, 12, 0, 16)
         })
