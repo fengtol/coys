@@ -47,12 +47,15 @@ func main() {
 		if peer.Port == sender.LocalAddr().(*net.UDPAddr).Port {
 			continue
 		}
-		if _, err := protocol.Parse(buffer[:n]); err != nil {
+		message, err := protocol.Parse(buffer[:n])
+		if err != nil {
 			log.Printf("discard invalid packet from %s: %v", peer, err)
 			continue
 		}
 		if _, err := sender.Write(buffer[:n]); err != nil {
 			log.Printf("broadcast packet from %s: %v", peer, err)
+			continue
 		}
+		log.Printf("broadcast clipboard update from %s (origin=%s, bytes=%d)", peer, message.Origin, n)
 	}
 }

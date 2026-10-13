@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import org.json.JSONObject
 import java.net.DatagramPacket
@@ -33,6 +34,9 @@ class ClipboardSyncService : Service() {
     private var remoteAddress: InetAddress? = null
     private var origin = ""
     private var lastText: String? = null
+    private var pendingRemoteText: String? = null
+    private var nextWriteAttemptAt = 0L
+    private var isWritingRemote = false
     private var multicastLock: WifiManager.MulticastLock? = null
     @Volatile private var active = false
 
@@ -83,6 +87,8 @@ class ClipboardSyncService : Service() {
                 soTimeout = RECEIVE_TIMEOUT_MS
             }
             lastText = readClipboardText()
+            pendingRemoteText = null
+            nextWriteAttemptAt = 0L
             active = true
             clipboard.addPrimaryClipChangedListener(clipboardListener)
             mainHandler.post(pollRunnable)
@@ -111,6 +117,11 @@ class ClipboardSyncService : Service() {
     private fun pollClipboard() {
         if (!active) return
         try {
+            val pendingText = pendingRemoteText
+            if (pendingText != null) {
+                writeRemoteClipboard(pendingText)
+                return
+            }
             val text = readClipboardText() ?: return
             if (text == lastText) return
             sendClipboard(text)
@@ -159,15 +170,13 @@ class ClipboardSyncService : Service() {
                 val message = parseMessage(packet.data, packet.length) ?: continue
                 if (message.first == origin) continue
                 mainHandler.post {
-                    if (!active || message.second == lastText) return@post
-                    try {
-                        lastText = message.second
-                        clipboard.setPrimaryClip(ClipData.newPlainText("Synced clipboard", message.second))
-                        updateNotification("已同步剪贴板")
-                    } catch (error: SecurityException) {
-                        Log.e(TAG, "Unable to write clipboard", error)
-                        updateNotification("写入剪贴板失败")
+                    if (!active) return@post
+                    if (message.second == lastText && pendingRemoteText == null) {
+                        updateNotification("收到广播，剪贴板内容相同")
+                        return@post
                     }
+                    pendingRemoteText = message.second
+                    writeRemoteClipboard(message.second)
                 }
             } catch (_: SocketTimeoutException) {
                 continue
@@ -177,6 +186,25 @@ class ClipboardSyncService : Service() {
             } catch (error: Exception) {
                 if (active) Log.e(TAG, "Unable to receive clipboard packet", error)
             }
+        }
+    }
+
+    private fun writeRemoteClipboard(text: String) {
+        if (isWritingRemote || SystemClock.elapsedRealtime() < nextWriteAttemptAt) return
+        isWritingRemote = true
+        try {
+            clipboard.setPrimaryClip(ClipData.newPlainText("Synced clipboard", text))
+            lastText = text
+            pendingRemoteText = null
+            nextWriteAttemptAt = 0L
+            Log.i(TAG, "Clipboard update received and written")
+            updateNotification("已同步剪贴板")
+        } catch (error: Exception) {
+            nextWriteAttemptAt = SystemClock.elapsedRealtime() + WRITE_RETRY_INTERVAL_MS
+            Log.e(TAG, "Unable to write clipboard; will retry", error)
+            updateNotification("收到更新，但写入失败；稍后重试")
+        } finally {
+            isWritingRemote = false
         }
     }
 
@@ -272,6 +300,7 @@ class ClipboardSyncService : Service() {
         private const val UDP_PORT = 65432
         private const val RECEIVE_TIMEOUT_MS = 1000
         private const val POLL_INTERVAL_MS = 500L
+        private const val WRITE_RETRY_INTERVAL_MS = 2000L
         private const val PROTOCOL_VERSION = 1
         private const val MESSAGE_TYPE = "clipboard"
         private const val MAX_TEXT_BYTES = 48 * 1024
